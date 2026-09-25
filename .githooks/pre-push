@@ -1,0 +1,34 @@
+#!/usr/bin/env sh
+# .githooks/pre-push
+#
+# Dev Sentinel — Git pre-push hook
+#
+# This file is intentionally minimal. All logic lives in sentinel/git_hook.py.
+#
+# Installation (run once per clone):
+#   git config core.hooksPath .githooks
+#
+# Or use the provided helper:
+#   python scripts/install_hooks.py
+#
+# To bypass this hook for a single push (e.g. WIP):
+#   git push --no-verify
+#
+# The hook reads the pre-push protocol from stdin and forwards it to the
+# Python adapter, which runs the full Dev Sentinel pipeline.
+#
+# Exit 0 → push allowed.
+# Exit 1 → push blocked.
+
+# Resolve the Python interpreter: prefer the project venv if present.
+if [ -x ".venv/bin/python" ]; then
+    PYTHON=".venv/bin/python"
+elif [ -x ".venv/Scripts/python.exe" ]; then
+    # Windows Git Bash / WSL
+    PYTHON=".venv/Scripts/python.exe"
+else
+    PYTHON="python3"
+fi
+
+# Forward stdin (Git's ref list) to the Python adapter.
+exec "$PYTHON" -m sentinel.git_hook
