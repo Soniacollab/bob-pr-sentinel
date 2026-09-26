@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dev-sentinel"
+version = "0.1.0"
+description = "AI-assisted Git pre-push safety tool. Catch regressions before they leave your machine."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+# CLI entry point installed by pip onto PATH.
+# Used by the generated pre-push hook in target repositories.
+dev-sentinel = "sentinel.cli:main"
+
+# Separate hook entry point so the pre-push script stays a one-liner.
+dev-sentinel-hook = "sentinel.git_hook:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sentinel*"]
+
+[tool.setuptools.package-data]
+sentinel = ["py.typed"]

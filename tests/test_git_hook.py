@@ -471,3 +471,104 @@ class TestNoAutoPush:
                 cmd = c[0][0] if c[0] else c[1].get("args", [])
                 if isinstance(cmd, list):
                     assert "push" not in cmd, f"git push must not be called: {cmd}"
+
+
+# ── P. INCIDENT PERSISTENCE ───────────────────────────────────────────────────
+
+class TestIncidentPersistence:
+    """Confirmed regressions write last-incident.json; failures keep exit code 1."""
+
+    @patch("sentinel.git_hook._git_root")
+    @patch("sentinel.git_hook.orchestrate_investigation",
+           return_value=_regression_report())
+    @patch("sentinel.git_hook._diff_for_ref", return_value=(["app/foo.py"], "diff"))
+    def test_confirmed_regression_writes_incident(self, mock_diff, mock_orch, mock_root, tmp_path):
+        """When regression_confirmed, last-incident.json is written under .git/dev-sentinel/."""
+        fake_git = tmp_path / "repo"
+        fake_git.mkdir()
+        (fake_git / ".git").mkdir()
+        mock_root.return_value = fake_git
+
+        result = run(_stdin(_normal_ref()))
+
+        assert result == 1
+        incident_file = fake_git / ".git" / "dev-sentinel" / "last-incident.json"
+        assert incident_file.exists(), "last-incident.json must be created"
+
+    @patch("sentinel.git_hook._git_root")
+    @patch("sentinel.git_hook.orchestrate_investigation",
+           return_value=_regression_report())
+    @patch("sentinel.git_hook._diff_for_ref", return_value=(["app/foo.py"], "diff"))
+    def test_incident_json_contains_expected_fields(self, mock_diff, mock_orch, mock_root, tmp_path):
+        """The incident JSON must contain all required top-level fields."""
+        fake_git = tmp_path / "repo"
+        fake_git.mkdir()
+        (fake_git / ".git").mkdir()
+        mock_root.return_value = fake_git
+
+        run(_stdin(_normal_ref()))
+
+        import json as _json
+        incident = _json.loads(
+            (fake_git / ".git" / "dev-sentinel" / "last-incident.json").read_text()
+        )
+        for field in (
+            "local_ref", "local_sha", "remote_ref", "remote_sha",
+            "changed_files", "changed_behaviour", "affected_components",
+            "suspected_issue", "reproduction_result", "status",
+        ):
+            assert field in incident, f"Missing field: {field}"
+        assert incident["status"] == "regression_confirmed"
+
+    @patch("sentinel.git_hook._git_root")
+    @patch("sentinel.git_hook.orchestrate_investigation",
+           return_value=_regression_report())
+    @patch("sentinel.git_hook._diff_for_ref", return_value=(["app/foo.py"], "diff"))
+    def test_incident_reproduction_result_is_plain_json(self, mock_diff, mock_orch, mock_root, tmp_path):
+        """reproduction_result must be a plain dict, not a dataclass."""
+        fake_git = tmp_path / "repo"
+        fake_git.mkdir()
+        (fake_git / ".git").mkdir()
+        mock_root.return_value = fake_git
+
+        run(_stdin(_normal_ref()))
+
+        import json as _json
+        incident = _json.loads(
+            (fake_git / ".git" / "dev-sentinel" / "last-incident.json").read_text()
+        )
+        repro = incident["reproduction_result"]
+        assert isinstance(repro, dict)
+        assert "passed" in repro
+        assert "exit_code" in repro
+        assert "stdout" in repro
+        assert "stderr" in repro
+
+    @patch("sentinel.git_hook._git_root")
+    @patch("sentinel.git_hook.orchestrate_investigation",
+           return_value=_regression_report())
+    @patch("sentinel.git_hook._diff_for_ref", return_value=(["app/foo.py"], "diff"))
+    def test_persistence_failure_keeps_exit_code_1(self, mock_diff, mock_orch, mock_root, tmp_path):
+        """If the incident file cannot be written, the push is still blocked (exit 1)."""
+        fake_git = tmp_path / "repo"
+        fake_git.mkdir()
+        (fake_git / ".git").mkdir()
+        mock_root.return_value = fake_git
+
+        # Make the directory read-only so mkdir/write_text fails.
+        git_dir = fake_git / ".git"
+        git_dir.chmod(0o555)
+        try:
+            result = run(_stdin(_normal_ref()))
+            assert result == 1
+        finally:
+            git_dir.chmod(0o755)
+
+    @patch("sentinel.git_hook.orchestrate_investigation", return_value=_clean_report())
+    @patch("sentinel.git_hook._diff_for_ref", return_value=(["app/foo.py"], "diff"))
+    def test_clean_push_does_not_write_incident(self, mock_diff, mock_orch, tmp_path):
+        """A clean push must never write an incident file."""
+        with patch("sentinel.git_hook._git_root", return_value=tmp_path):
+            run(_stdin(_normal_ref()))
+        incident_file = tmp_path / ".git" / "dev-sentinel" / "last-incident.json"
+        assert not incident_file.exists()

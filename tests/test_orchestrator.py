@@ -3,24 +3,25 @@ tests/test_orchestrator.py
 
 Adversarial validation suite for sentinel/orchestrator.py.
 
-Covers all scenarios A–L from the quality specification:
+Updated to match the new orchestrator contract:
+
+  The orchestrator runs: Explorer → Impact → Tester → Runner
+  If focused tests fail → status="regression_confirmed", STOP.
+  The orchestrator does NOT call the Fixer.
+
+Scenarios covered:
   A. Clean path (no regression)
-  B. Confirmed regression → fixed
+  B. Confirmed regression → regression_confirmed (Fixer is NOT called)
   C. Speculative / unconfirmed issue
-  D. Fix failure
-  E. Full-suite failure after focused tests pass
+  D. Regression confirmed, no fix applied (Fixer not the orchestrator's job)
+  E. Full-suite invariant (orchestrator stops at regression_confirmed)
   F. Invalid / empty inputs
-  G. Agent isolation (read-only enforcement)
+  G. Agent isolation (Fixer is never called by the orchestrator)
   H. No false positives
   I. No false negatives
   J. State transitions
   K. Regression safety invariants
   L. Orchestrator self-tests
-
-Tests use unittest.mock to replace the agent and runner calls so that:
-  - No production files are modified by the test suite itself.
-  - Each scenario is deterministic and isolated.
-  - The real regression scenario (B) uses the live pipeline.
 """
 
 import subprocess
@@ -31,7 +32,6 @@ from sentinel.orchestrator import orchestrate_investigation
 from sentinel.models import (
     CodeMap, ImpactReport, TestPlan, TestResult, EvidenceReport,
 )
-from sentinel.agents.fixer import FixReport
 
 
 # ── Fixtures / builders ───────────────────────────────────────────────────────
@@ -89,39 +89,10 @@ def _empty_test_plan() -> TestPlan:
     return TestPlan(target_file="tests/test_preprocessing.py", new_tests=[])
 
 
-def _fixed_report(**kw) -> FixReport:
-    defaults = dict(
-        fix_justified=True,
-        files_modified=["app/preprocessing.py"],
-        original_failure="TypeError",
-        root_cause="guard removed",
-        fix_applied="restored guard",
-        fix_rationale="minimal",
-        focused_test_result=_passing_result(),
-        full_test_result=_passing_result(),
-        status="fixed",
-        remaining_uncertainty="",
-    )
-    defaults.update(kw)
-    return FixReport(**defaults)
-
-
-def _fix_failed_report(**kw) -> FixReport:
-    base = _fixed_report(
-        status="fix_failed",
-        focused_test_result=_failing_result(),
-        full_test_result=None,
-        remaining_uncertainty="Focused tests still fail.",
-    )
-    for k, v in kw.items():
-        setattr(base, k, v)
-    return base
-
-
 # ── A. CLEAN PATH ─────────────────────────────────────────────────────────────
 
 class TestCleanPath:
-    """No regression, pipeline must stop without invoking Fixer."""
+    """No regression, pipeline must stop without ever invoking the Fixer."""
 
     def test_no_changes_returns_clean(self):
         result = orchestrate_investigation([], "")
@@ -135,41 +106,38 @@ class TestCleanPath:
         result = orchestrate_investigation(["app/foo.py"], "   \n  ")
         assert result.status == "clean"
 
-    @patch("sentinel.orchestrator.run_fixer")
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_passing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_clean_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
     def test_low_confidence_no_inputs_stops_early(
-        self, mock_explorer, mock_impact, mock_tester, mock_runner, mock_fixer
+        self, mock_explorer, mock_impact, mock_tester, mock_runner
     ):
         result = orchestrate_investigation(["app/foo.py"], "- comment\n")
         assert result.status == "clean"
-        mock_fixer.assert_not_called()
-        # Tester and Runner also not called (early exit before them)
+        # Tester and Runner not called (early exit before them)
         mock_tester.assert_not_called()
         mock_runner.assert_not_called()
 
-    @patch("sentinel.orchestrator.run_fixer")
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_passing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
     def test_medium_confidence_but_passing_tests_returns_clean(
-        self, mock_explorer, mock_impact, mock_tester, mock_runner, mock_fixer
+        self, mock_explorer, mock_impact, mock_tester, mock_runner
     ):
         """Impact suspects something, but focused tests all pass → no regression."""
         result = orchestrate_investigation(["app/foo.py"], "- guard\n")
         assert result.status == "clean"
         assert result.reproduction_result.passed is True
-        mock_fixer.assert_not_called()
 
 
 # ── B. CONFIRMED REGRESSION (live pipeline) ───────────────────────────────────
 
 class TestConfirmedRegression:
     """Real regression: None/empty-string guard removed in preprocessing.py.
-    Uses the actual agents and runner against the live repository.
+    The orchestrator must reach regression_confirmed and STOP there.
+    The Fixer is NOT called.
     Skipped when the guard is currently present (healthy tree).
     """
 
@@ -183,8 +151,8 @@ class TestConfirmedRegression:
         )
         return r.stdout.splitlines()
 
-    def test_confirmed_regression_reaches_fixed(self):
-        """End-to-end: broken guard → regression_confirmed → fixed."""
+    def test_confirmed_regression_stops_at_regression_confirmed(self):
+        """End-to-end: broken guard → regression_confirmed, no further action."""
         diff    = self._get_live_diff()
         changed = self._get_live_files()
 
@@ -200,117 +168,115 @@ class TestConfirmedRegression:
             )
 
         result = orchestrate_investigation(changed, diff)
-        # After the Fixer runs, the file will be repaired.
-        assert result.status in ("fixed", "regression_confirmed"), (
-            f"Unexpected status: {result.status}"
+        assert result.status == "regression_confirmed", (
+            f"Expected regression_confirmed, got: {result.status}"
         )
         assert result.reproduction_result is not None
         assert result.reproduction_result.passed is False, (
             "Reproduction should have failed — tests must detect the regression."
+        )
+        # The orchestrator must NOT have applied a fix.
+        assert result.fix_applied == "", (
+            "The orchestrator must not apply a fix — that is the Fixer's job."
         )
 
 
 # ── C. SPECULATIVE / UNCONFIRMED ──────────────────────────────────────────────
 
 class TestSpeculativeIssue:
-    """Impact reports a concern but focused tests pass → Fixer MUST NOT run."""
+    """Impact reports a concern but focused tests pass.
+    The Fixer must never be invoked — and now it structurally cannot be."""
 
-    @patch("sentinel.orchestrator.run_fixer")
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_passing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_fixer_not_called_when_tests_pass(
-        self, mock_explorer, mock_impact, mock_tester, mock_runner, mock_fixer
+    def test_passing_focused_tests_produce_clean(
+        self, mock_explorer, mock_impact, mock_tester, mock_runner
     ):
         result = orchestrate_investigation(["app/foo.py"], "- guard\n")
         assert result.status == "clean"
-        mock_fixer.assert_not_called()
 
-    @patch("sentinel.orchestrator.run_fixer")
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_passing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
     def test_status_not_regression_confirmed_when_tests_pass(
-        self, mock_explorer, mock_impact, mock_tester, mock_runner, mock_fixer
+        self, mock_explorer, mock_impact, mock_tester, mock_runner
     ):
         result = orchestrate_investigation(["app/foo.py"], "- guard\n")
         assert result.status != "regression_confirmed"
 
 
-# ── D. FIX FAILURE ────────────────────────────────────────────────────────────
+# ── D. REGRESSION CONFIRMED — NO FIX APPLIED ─────────────────────────────────
 
-class TestFixFailure:
-    """Fixer cannot repair the issue → status must stay regression_confirmed."""
+class TestRegressionConfirmedNoFix:
+    """When focused tests fail the orchestrator stops at regression_confirmed.
+    No fix is applied. No fix_applied field is set. Reproduction evidence
+    is preserved for the caller (e.g. `dev-sentinel fix`)."""
 
-    @patch("sentinel.orchestrator.run_fixer",
-           return_value=_fix_failed_report())
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_fix_failed_preserves_regression_confirmed(
-        self, mock_explorer, mock_impact, mock_tester, mock_runner, mock_fixer
+    def test_failing_tests_produce_regression_confirmed(
+        self, mock_explorer, mock_impact, mock_tester, mock_runner
     ):
         result = orchestrate_investigation(["app/foo.py"], "- guard\n")
         assert result.status == "regression_confirmed"
-        assert result.status != "fixed"
 
-    @patch("sentinel.orchestrator.run_fixer",
-           return_value=_fix_failed_report())
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_reproduction_result_preserved_on_fix_failure(
-        self, mock_explorer, mock_impact, mock_tester, mock_runner, mock_fixer
+    def test_no_fix_applied_by_orchestrator(
+        self, mock_explorer, mock_impact, mock_tester, mock_runner
+    ):
+        """The orchestrator must never set fix_applied — that is the Fixer's job."""
+        result = orchestrate_investigation(["app/foo.py"], "- guard\n")
+        assert result.fix_applied == ""
+
+    @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
+    @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
+    @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
+    @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
+    def test_reproduction_result_preserved(
+        self, mock_explorer, mock_impact, mock_tester, mock_runner
     ):
         result = orchestrate_investigation(["app/foo.py"], "- guard\n")
         assert result.reproduction_result is not None
         assert result.reproduction_result.passed is False
 
 
-# ── E. FULL-SUITE FAILURE AFTER FOCUSED TESTS PASS ───────────────────────────
+# ── E. ORCHESTRATOR NEVER PRODUCES "fixed" ───────────────────────────────────
 
-class TestFullSuiteFailureAfterFocused:
-    """Focused tests pass post-fix but full suite fails → NOT fixed."""
+class TestOrchestratorNeverFixed:
+    """The orchestrator must never produce status="fixed".
+    That transition belongs to the Fixer, which is external."""
 
-    @patch("sentinel.orchestrator.run_fixer",
-           return_value=_fix_failed_report(
-               focused_test_result=_passing_result(),
-               full_test_result=_failing_result(),
-               status="fix_failed",
-               remaining_uncertainty="Full suite failed after focused tests passed.",
-           ))
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_full_suite_failure_is_not_fixed(
-        self, mock_explorer, mock_impact, mock_tester, mock_runner, mock_fixer
+    def test_orchestrator_cannot_produce_fixed_status(
+        self, mock_explorer, mock_impact, mock_tester, mock_runner
     ):
         result = orchestrate_investigation(["app/foo.py"], "- guard\n")
-        assert result.status == "regression_confirmed"
         assert result.status != "fixed"
 
-    @patch("sentinel.orchestrator.run_fixer",
-           return_value=_fix_failed_report(
-               focused_test_result=_passing_result(),
-               full_test_result=_failing_result(),
-               status="fix_failed",
-               remaining_uncertainty="Full suite failed after focused tests passed.",
-           ))
-    @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
+    def test_clean_path_never_fixed(self):
+        result = orchestrate_investigation([], "")
+        assert result.status != "fixed"
+
+    @patch("sentinel.orchestrator._safe_run_tests", return_value=_passing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_full_suite_failure_evidence_preserved(
-        self, mock_explorer, mock_impact, mock_tester, mock_runner, mock_fixer
+    def test_passing_tests_never_fixed(
+        self, mock_explorer, mock_impact, mock_tester, mock_runner
     ):
         result = orchestrate_investigation(["app/foo.py"], "- guard\n")
-        assert result.final_test_result is not None
-        assert result.final_test_result.passed is False
+        assert result.status != "fixed"
 
 
 # ── F. INVALID / EMPTY INPUTS ────────────────────────────────────────────────
@@ -326,7 +292,6 @@ class TestInvalidInputs:
         assert result.status == "clean"
 
     def test_none_diff_returns_clean(self):
-        # diff=None: the guard checks `not diff` which is True for None
         result = orchestrate_investigation(["app/foo.py"], None)
         assert result.status == "clean"
 
@@ -355,95 +320,86 @@ class TestInvalidInputs:
         assert result.status == "clean"
         assert "Tester" in result.suspected_issue
 
-    @patch("sentinel.orchestrator.run_fixer",   side_effect=RuntimeError("boom"))
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_fixer_exception_preserves_regression_confirmed(
-        self, me, mi, mt, mr, mf
+    def test_confirmed_regression_with_no_fixer_in_pipeline(
+        self, me, mi, mt, mr
     ):
+        """Replaces the old test_fixer_exception_preserves_regression_confirmed.
+        The orchestrator now stops at regression_confirmed without touching the
+        Fixer at all, so a Fixer exception is simply impossible here."""
         result = orchestrate_investigation(["app/foo.py"], "- guard\n")
         assert result.status == "regression_confirmed"
-        assert "Fixer" in result.suspected_issue
 
 
 # ── G. AGENT ISOLATION ───────────────────────────────────────────────────────
 
 class TestAgentIsolation:
-    """Explorer, Impact, Tester must not modify files.
-    Fixer is the only stage allowed to write production code.
-    These are enforced structurally — we verify the Fixer is NOT called
-    until status == regression_confirmed."""
+    """The Fixer is never part of the orchestrator pipeline.
+    Explorer, Impact, and Tester are read-only. Runner only executes tests."""
 
-    @patch("sentinel.orchestrator.run_fixer")
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_passing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_clean_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_fixer_not_called_on_clean_path(
-        self, me, mi, mt, mr, mock_fixer
-    ):
-        orchestrate_investigation(["app/foo.py"], "  ")
-        mock_fixer.assert_not_called()
+    def test_orchestrator_does_not_import_run_fixer(self, me, mi, mt, mr):
+        """run_fixer must not exist as an attribute of the orchestrator module."""
+        import sentinel.orchestrator as orch_module
+        assert not hasattr(orch_module, "run_fixer"), (
+            "run_fixer must not be imported into sentinel.orchestrator"
+        )
 
-    @patch("sentinel.orchestrator.run_fixer")
+    @patch("sentinel.orchestrator._safe_run_tests", return_value=_passing_result())
+    @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
+    @patch("sentinel.orchestrator.run_impact",  return_value=_clean_impact())
+    @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
+    def test_clean_path_no_fixer(self, me, mi, mt, mr):
+        """Clean path: orchestrator runs and returns without any Fixer involvement."""
+        result = orchestrate_investigation(["app/foo.py"], "  ")
+        assert result.status == "clean"
+        assert result.fix_applied == ""
+
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_passing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_fixer_not_called_when_focused_tests_pass(
-        self, me, mi, mt, mr, mock_fixer
-    ):
-        orchestrate_investigation(["app/foo.py"], "- guard\n")
-        mock_fixer.assert_not_called()
+    def test_passing_focused_tests_no_fixer(self, me, mi, mt, mr):
+        """Passing focused tests: pipeline stops at clean without touching Fixer."""
+        result = orchestrate_investigation(["app/foo.py"], "- guard\n")
+        assert result.status == "clean"
+        assert result.fix_applied == ""
 
-    @patch("sentinel.orchestrator.run_fixer",   return_value=_fixed_report())
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_fixer_called_exactly_once_on_confirmed_regression(
-        self, me, mi, mt, mr, mock_fixer
-    ):
-        orchestrate_investigation(["app/foo.py"], "- guard\n")
-        mock_fixer.assert_called_once()
-
-    @patch("sentinel.orchestrator.run_fixer",   return_value=_fixed_report())
-    @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
-    @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
-    @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
-    @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_fixer_receives_regression_confirmed_evidence(
-        self, me, mi, mt, mr, mock_fixer
-    ):
-        orchestrate_investigation(["app/foo.py"], "- guard\n")
-        call_args = mock_fixer.call_args
-        evidence: EvidenceReport = call_args[0][0]
-        assert evidence.status == "regression_confirmed"
-        assert evidence.reproduction_result is not None
-        assert evidence.reproduction_result.passed is False
+    def test_confirmed_regression_no_fixer_invoked(self, me, mi, mt, mr):
+        """Confirmed regression: orchestrator stops at regression_confirmed.
+        The fix_applied field must remain empty — the Fixer was never called."""
+        result = orchestrate_investigation(["app/foo.py"], "- guard\n")
+        assert result.status == "regression_confirmed"
+        assert result.fix_applied == "", (
+            "Orchestrator must not invoke the Fixer or populate fix_applied."
+        )
 
 
 # ── H. NO FALSE POSITIVES ────────────────────────────────────────────────────
 
 class TestNoFalsePositives:
 
-    @patch("sentinel.orchestrator.run_fixer")
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_passing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
-    @patch("sentinel.orchestrator.run_impact",
-           return_value=_high_impact())   # Impact PREDICTS, but tests pass
+    @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
     def test_impact_prediction_not_treated_as_proof(
-        self, me, mi, mt, mr, mock_fixer
+        self, me, mi, mt, mr
     ):
         """High-confidence impact + passing tests → clean, not regression_confirmed."""
         result = orchestrate_investigation(["app/foo.py"], "- guard\n")
         assert result.status == "clean"
-        mock_fixer.assert_not_called()
 
-    @patch("sentinel.orchestrator.run_fixer")
     @patch("sentinel.orchestrator._safe_run_tests",
            return_value=TestResult(
                passed=True, exit_code=0,
@@ -454,7 +410,7 @@ class TestNoFalsePositives:
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
     def test_passing_test_not_reported_as_failure(
-        self, me, mi, mt, mr, mock_fixer
+        self, me, mi, mt, mr
     ):
         result = orchestrate_investigation(["app/foo.py"], "- guard\n")
         assert result.reproduction_result.passed is True
@@ -465,44 +421,42 @@ class TestNoFalsePositives:
 
 class TestNoFalseNegatives:
 
-    @patch("sentinel.orchestrator.run_fixer",   return_value=_fixed_report())
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
     def test_genuine_regression_reaches_regression_confirmed(
-        self, me, mi, mt, mr, mf
+        self, me, mi, mt, mr
     ):
+        """A genuine reproducible failure must reach regression_confirmed."""
         result = orchestrate_investigation(["app/foo.py"], "- guard\n")
-        # Fixer fixed it; final status is fixed, but regression was confirmed along the way.
-        assert result.fix_applied  # evidence preserved in report
+        assert result.status == "regression_confirmed"
 
-    @patch("sentinel.orchestrator.run_fixer",   return_value=_fixed_report())
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
     def test_failing_test_evidence_preserved_in_report(
-        self, me, mi, mt, mr, mf
+        self, me, mi, mt, mr
     ):
         result = orchestrate_investigation(["app/foo.py"], "- guard\n")
         assert result.reproduction_result is not None
         assert result.reproduction_result.passed is False
 
-    @patch("sentinel.orchestrator.run_fixer",   return_value=_fixed_report())
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_fixer_receives_complete_evidence(
-        self, me, mi, mt, mr, mock_fixer
+    def test_report_carries_complete_evidence_for_fixer(
+        self, me, mi, mt, mr
     ):
-        orchestrate_investigation(["app/foo.py"], "- guard\n")
-        ev: EvidenceReport = mock_fixer.call_args[0][0]
-        assert ev.changed_files == ["app/foo.py"]
-        assert ev.reproduction_result.passed is False
-        assert ev.status == "regression_confirmed"
-        assert ev.changed_behaviour  # populated from impact
+        """The EvidenceReport returned to the caller must contain everything
+        the external Fixer (`dev-sentinel fix`) will need."""
+        result = orchestrate_investigation(["app/foo.py"], "- guard\n")
+        assert result.changed_files == ["app/foo.py"]
+        assert result.reproduction_result.passed is False
+        assert result.status == "regression_confirmed"
+        assert result.changed_behaviour  # populated from Impact
 
 
 # ── J. STATE TRANSITIONS ─────────────────────────────────────────────────────
@@ -521,76 +475,77 @@ class TestStateTransitions:
         r = orchestrate_investigation(["f.py"], "- x\n")
         assert r.status == "clean"
 
-    @patch("sentinel.orchestrator.run_fixer",   return_value=_fixed_report())
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_regression_confirmed_to_fixed(self, me, mi, mt, mr, mf):
-        r = orchestrate_investigation(["f.py"], "- guard\n")
-        assert r.status == "fixed"
-
-    @patch("sentinel.orchestrator.run_fixer",   return_value=_fix_failed_report())
-    @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
-    @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
-    @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
-    @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_regression_confirmed_plus_fix_failed_stays_regression_confirmed(
-        self, me, mi, mt, mr, mf
-    ):
+    def test_failing_reproduction_to_regression_confirmed(self, me, mi, mt, mr):
+        """Replaces the old test_regression_confirmed_to_fixed.
+        The orchestrator's terminal state for a failing reproduction is now
+        regression_confirmed, not fixed."""
         r = orchestrate_investigation(["f.py"], "- guard\n")
         assert r.status == "regression_confirmed"
 
-    @patch("sentinel.orchestrator.run_fixer")
+    @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
+    @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
+    @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
+    @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
+    def test_regression_confirmed_is_terminal_state(self, me, mi, mt, mr):
+        """Replaces test_regression_confirmed_plus_fix_failed_stays_regression_confirmed.
+        Without the Fixer, regression_confirmed is always the terminal state
+        when reproduction fails."""
+        r = orchestrate_investigation(["f.py"], "- guard\n")
+        assert r.status == "regression_confirmed"
+
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_passing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_no_skip_from_potential_to_fixed(self, me, mi, mt, mr, mock_fixer):
-        """Passing focused tests → clean.  Must not skip to fixed."""
+    def test_no_skip_from_potential_to_fixed(self, me, mi, mt, mr):
+        """Passing focused tests → clean. Must not skip to fixed."""
         r = orchestrate_investigation(["f.py"], "- guard\n")
         assert r.status != "fixed"
-        mock_fixer.assert_not_called()
 
 
 # ── K. REGRESSION SAFETY INVARIANTS ─────────────────────────────────────────
 
 class TestRegressionSafety:
 
-    @patch("sentinel.orchestrator.run_fixer")
-    @patch("sentinel.orchestrator._safe_run_tests", return_value=_passing_result())
-    @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
-    @patch("sentinel.orchestrator.run_impact",  return_value=_clean_impact())
-    @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_fixer_never_called_speculatively(self, me, mi, mt, mr, mock_fixer):
-        orchestrate_investigation(["f.py"], "  ")
-        mock_fixer.assert_not_called()
+    def test_fixer_never_called_speculatively(self):
+        """The orchestrator structurally cannot call the Fixer (not imported)."""
+        import sentinel.orchestrator as orch_module
+        assert not hasattr(orch_module, "run_fixer")
 
-    @patch("sentinel.orchestrator.run_fixer",   return_value=_fixed_report())
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_exit_codes_not_swallowed(self, me, mi, mt, mr, mf):
+    def test_exit_codes_not_swallowed(self, me, mi, mt, mr):
         r = orchestrate_investigation(["f.py"], "- guard\n")
         assert r.reproduction_result.exit_code != 0
 
-    @patch("sentinel.orchestrator.run_fixer",   return_value=_fixed_report())
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_fixed_only_when_fixer_reports_fixed(self, me, mi, mt, mr, mf):
+    def test_orchestrator_never_produces_fixed(self, me, mi, mt, mr):
+        """Replaces test_fixed_only_when_fixer_reports_fixed.
+        The orchestrator can no longer produce 'fixed' under any circumstances."""
         r = orchestrate_investigation(["f.py"], "- guard\n")
-        assert r.status == "fixed"
+        assert r.status != "fixed"
 
-    @patch("sentinel.orchestrator.run_fixer",   return_value=_fix_failed_report())
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_not_fixed_when_fixer_reports_fix_failed(self, me, mi, mt, mr, mf):
+    def test_regression_confirmed_never_becomes_fixed_without_fixer(
+        self, me, mi, mt, mr
+    ):
+        """Replaces test_not_fixed_when_fixer_reports_fix_failed.
+        Without the Fixer in the pipeline, regression_confirmed can never
+        become fixed inside orchestrate_investigation."""
         r = orchestrate_investigation(["f.py"], "- guard\n")
+        assert r.status == "regression_confirmed"
         assert r.status != "fixed"
 
 
@@ -618,21 +573,24 @@ class TestOrchestratorSelf:
         r = orchestrate_investigation(["app/foo.py"], "- guard\n")
         assert r.changed_behaviour == _high_impact().changed_behaviour
 
-    @patch("sentinel.orchestrator.run_fixer",   return_value=_fixed_report())
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_fix_applied_propagated_to_report(self, me, mi, mt, mr, mf):
+    def test_fix_applied_empty_after_orchestrator(self, me, mi, mt, mr):
+        """Replaces test_fix_applied_propagated_to_report.
+        The orchestrator never sets fix_applied — that field is only
+        populated by the external Fixer."""
         r = orchestrate_investigation(["app/foo.py"], "- guard\n")
-        assert r.fix_applied == "restored guard"
+        assert r.fix_applied == ""
 
-    @patch("sentinel.orchestrator.run_fixer",   return_value=_fixed_report())
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_final_test_result_populated_after_fix(self, me, mi, mt, mr, mf):
+    def test_final_test_result_none_after_orchestrator(self, me, mi, mt, mr):
+        """Replaces test_final_test_result_populated_after_fix.
+        The orchestrator never runs the full suite — final_test_result is None.
+        It is only populated after a successful external Fixer run."""
         r = orchestrate_investigation(["app/foo.py"], "- guard\n")
-        assert r.final_test_result is not None
-        assert r.final_test_result.passed is True
+        assert r.final_test_result is None

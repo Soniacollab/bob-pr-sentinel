@@ -8,6 +8,8 @@ Responsibility:
   2. Compute the correct diff for each ref being pushed.
   3. Feed the diff to the existing Orchestrator.
   4. Translate the EvidenceReport into a push decision (exit 0 / exit 1).
+  5. Persist a confirmed regression incident under .git/dev-sentinel/last-incident.json
+     so that `dev-sentinel fix` can later request explicit developer authorization.
 
 This module is intentionally thin. All investigation logic lives in
 sentinel/orchestrator.py and the agents beneath it.
@@ -61,18 +63,23 @@ This module NEVER:
   - pushes automatically (no git push)
   - stashes changes without user consent
   - deletes or rewrites history
+  - modifies tracked source files
 
 It ONLY:
   - reads Git metadata (read-only git commands)
   - passes data to the Orchestrator
+  - persists evidence to .git/dev-sentinel/last-incident.json (untracked)
   - exits with 0 (allow) or 1 (block)
 """
 
+import json
 import subprocess
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from sentinel.orchestrator import orchestrate_investigation
+from sentinel.models import EvidenceReport
 
 # The all-zeros SHA that Git uses to indicate "does not exist".
 ZERO_SHA = "0" * 40
@@ -115,6 +122,17 @@ def _git(*args: str, check: bool = True) -> str:
     return result.stdout.strip()
 
 
+def _git_root() -> Path:
+    """Return the absolute path of the repository root.
+
+    Uses ``git rev-parse --show-toplevel`` so the result is correct regardless
+    of the current working directory.
+
+    Raises subprocess.CalledProcessError if not inside a Git repository.
+    """
+    return Path(_git("rev-parse", "--show-toplevel"))
+
+
 def _root_commit() -> str:
     """Return the SHA of the repository's first-ever commit."""
     return _git("rev-list", "--max-parents=0", "HEAD")
@@ -155,6 +173,45 @@ def _diff_for_ref(ref: PushRef) -> tuple[list[str], str]:
     return changed_files, diff_text
 
 
+# ── Incident persistence ──────────────────────────────────────────────────────
+
+def _incident_path(git_root: Path) -> Path:
+    """Return the path to the incident JSON file."""
+    return git_root / ".git" / "dev-sentinel" / "last-incident.json"
+
+
+def _persist_incident(ref: PushRef, report: EvidenceReport, git_root: Path) -> None:
+    """Write a JSON incident record under .git/dev-sentinel/last-incident.json.
+
+    Raises OSError if the file cannot be written.
+    Does NOT modify tracked files, does NOT stage, commit, or push.
+    """
+    incident_dir = git_root / ".git" / "dev-sentinel"
+    incident_dir.mkdir(parents=True, exist_ok=True)
+
+    repro = report.reproduction_result
+    incident: dict = {
+        "local_ref":           ref.local_ref,
+        "local_sha":           ref.local_sha,
+        "remote_ref":          ref.remote_ref,
+        "remote_sha":          ref.remote_sha,
+        "changed_files":       report.changed_files,
+        "changed_behaviour":   report.changed_behaviour,
+        "affected_components": report.affected_components,
+        "suspected_issue":     report.suspected_issue,
+        "reproduction_result": {
+            "passed":    repro.passed    if repro else None,
+            "exit_code": repro.exit_code if repro else None,
+            "stdout":    repro.stdout    if repro else "",
+            "stderr":    repro.stderr    if repro else "",
+        },
+        "status": "regression_confirmed",
+    }
+
+    path = _incident_path(git_root)
+    path.write_text(json.dumps(incident, indent=2), encoding="utf-8")
+
+
 # ── stdin parser ──────────────────────────────────────────────────────────────
 
 def parse_push_refs(stdin_text: str) -> list[PushRef]:
@@ -186,7 +243,7 @@ def _print_header() -> None:
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 
-def _print_result(status: str, fix_applied: str) -> None:
+def _print_result(status: str, report: EvidenceReport) -> None:
     """Print a human-readable summary for the given pipeline status."""
     if status == "clean":
         print()
@@ -197,7 +254,7 @@ def _print_result(status: str, fix_applied: str) -> None:
         print()
         print("⚠  Regression confirmed.")
         print()
-        print(f"🔧 Fix applied and verified: {fix_applied}")
+        print(f"🔧 Fix applied and verified: {report.fix_applied}")
         print()
         print("   Push BLOCKED.")
         print("   Review the generated fix, stage it, commit it,")
@@ -205,10 +262,44 @@ def _print_result(status: str, fix_applied: str) -> None:
         print()
     elif status == "regression_confirmed":
         print()
-        print("✗  Regression confirmed — fix could not be applied or verified.")
+        print("✗ PUSH BLOCKED")
         print()
-        print("   Push BLOCKED.")
-        print("   Resolve the regression before pushing.")
+        print("Regression confirmed")
+        print()
+
+        if report.changed_files:
+            print("📍 Changed files")
+            for f in report.changed_files:
+                print(f"   {f}")
+            print()
+
+        repro = report.reproduction_result
+        if repro:
+            print("🧪 Evidence")
+            print(f"   Tests passed: {repro.passed}")
+            print(f"   Exit code:    {repro.exit_code}")
+            if repro.stdout.strip():
+                # Show a condensed excerpt (last 10 lines of stdout)
+                lines = repro.stdout.strip().splitlines()
+                excerpt = lines[-10:] if len(lines) > 10 else lines
+                for line in excerpt:
+                    print(f"   {line}")
+            print()
+
+        if report.affected_components:
+            print("Affected:")
+            for comp in report.affected_components:
+                print(f"   {comp}")
+            print()
+
+        if report.suspected_issue:
+            print("🔎 Suspected cause")
+            # Wrap long suspected_issue text sensibly
+            for line in report.suspected_issue.splitlines():
+                print(f"   {line}")
+            print()
+
+        print("→ Run `dev-sentinel fix` to review and authorize a fix.")
         print()
     else:
         # "pending" or any unexpected value — treat conservatively
@@ -254,6 +345,12 @@ def run(stdin_text: str) -> int:
         print()
         return 0
 
+    # Resolve the git root once for this run (used for incident persistence).
+    try:
+        git_root = _git_root()
+    except subprocess.CalledProcessError:
+        git_root = None  # best-effort; persistence will be skipped if None
+
     # Analyse each ref independently. Block on the first regression found.
     for ref in refs:
         if ref.is_deletion:
@@ -283,7 +380,38 @@ def run(stdin_text: str) -> int:
             print("   Push BLOCKED as a safety precaution.")
             return 1
 
-        _print_result(report.status, report.fix_applied)
+        if report.status == "regression_confirmed":
+            # Persist the evidence before printing so the user is told
+            # the correct next step even if persistence fails.
+            if git_root is not None:
+                try:
+                    _persist_incident(ref, report, git_root)
+                except OSError as exc:
+                    # Persistence failed — still block, but warn clearly.
+                    _print_result(report.status, report)
+                    print(
+                        f"⚠  WARNING: The regression was confirmed but the evidence "
+                        f"could not be saved ({exc})."
+                    )
+                    print(
+                        "   `dev-sentinel fix` is NOT available until the incident "
+                        "can be written to .git/dev-sentinel/last-incident.json."
+                    )
+                    print()
+                    return 1
+            else:
+                _print_result(report.status, report)
+                print(
+                    "⚠  WARNING: Could not determine the git root — "
+                    "incident evidence was NOT persisted."
+                )
+                print(
+                    "   `dev-sentinel fix` will not be available."
+                )
+                print()
+                return 1
+
+        _print_result(report.status, report)
 
         if _exit_code(report.status) != 0:
             return 1
