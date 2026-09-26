@@ -119,6 +119,20 @@ class TestCleanPath:
         mock_tester.assert_not_called()
         mock_runner.assert_not_called()
 
+    @patch(
+        "sentinel.orchestrator.run_tests",
+        side_effect=RuntimeError("pytest could not start"),
+    )
+    def test_runner_failure_blocks_as_analysis_failed(self, mock_run_tests):
+        result = orchestrate_investigation(
+            ["app/foo.py"],
+            "- changed line\n",
+        )
+
+        assert result.status == "analysis_failed"
+        assert result.reproduction_result is None
+        assert "pytest could not start" in result.suspected_issue
+
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_passing_result())
     @patch("sentinel.orchestrator.run_tester",  return_value=_empty_test_plan())
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())

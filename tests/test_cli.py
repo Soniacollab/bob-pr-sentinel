@@ -151,8 +151,17 @@ class TestConfirmationNegative:
         result, mock_fixer = self._run_with_answer(tmp_path, "N")
         mock_fixer.assert_not_called()
 
-    def test_garbage_input_does_not_call_fixer(self, tmp_path):
-        result, mock_fixer = self._run_with_answer(tmp_path, "maybe")
+    def test_garbage_input_then_n_does_not_call_fixer(self, tmp_path):
+        git_root = _make_incident(tmp_path, local_sha=SHA_A)
+        with (
+            patch("sentinel.cli._git_toplevel", return_value=git_root),
+            patch("sentinel.cli._git_head_sha", return_value=SHA_A),
+            patch("builtins.input", side_effect=["maybe", "n"]),
+            patch("sentinel.cli.run_fixer") as mock_fixer,
+        ):
+            result = _cmd_fix()
+
+        assert result == 0
         mock_fixer.assert_not_called()
 
     def test_eof_does_not_call_fixer(self, tmp_path):

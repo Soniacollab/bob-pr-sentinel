@@ -34,21 +34,20 @@ from sentinel.runner          import run_tests
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _safe_run_tests(target: str | None = None) -> TestResult:
-    """Thin wrapper around run_tests that never propagates exceptions.
+def _safe_run_tests(target: str | None = None) -> TestResult | None:
+    """Run tests safely.
 
-    If the test runner itself crashes (missing pytest, import error, etc.) the
-    result is treated as a failure with the exception text in stderr.
+    Returns the real TestResult when pytest executed.
+    Returns None when the test runner itself could not execute.
     """
     try:
         return run_tests(target)
     except Exception as exc:
-        return TestResult(
-            passed=False,
-            exit_code=-1,
-            stdout="",
-            stderr=f"Test runner raised an exception: {exc}\n{_traceback.format_exc()}",
-        )
+        _safe_run_tests.last_error = str(exc)
+        return None
+
+
+_safe_run_tests.last_error = ""
 
 
 # ── Public interface ──────────────────────────────────────────────────────────
@@ -130,13 +129,16 @@ def orchestrate_investigation(changed_files: list[str], diff: str) -> EvidenceRe
     reproduction_result = _safe_run_tests(test_target)
     report.reproduction_result = reproduction_result
 
-    # ── C / suspicion unfounded: focused tests pass ───────────────────────────
-    # Impact predicted a concern but actual test execution shows no failure.
-    # This is NOT a confirmed regression.
+    if reproduction_result is None:
+        report.status = "analysis_failed"
+        report.suspected_issue += (
+            f"  Test runner could not execute: {_safe_run_tests.last_error}"
+        )
+        return report
+
     if reproduction_result.passed:
         report.status = "clean"
         return report
 
-    # ── Regression confirmed by executable evidence ───────────────────────────
     report.status = "regression_confirmed"
     return report

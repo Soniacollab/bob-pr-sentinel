@@ -239,14 +239,20 @@ def _cmd_fix() -> int:
 
     # E. Ask for explicit authorization.
     try:
-        answer = input("Apply this fix? [y/N] ").strip()
+        while True:
+            answer = input("Apply this fix? [y/N] ").strip().lower()
+
+            if answer == "y":
+                break
+
+            if answer in ("", "n"):
+                print("   Fix cancelled.")
+                return 0
+
+            print("   Please answer y or n.")
     except (EOFError, KeyboardInterrupt):
         print()
         print("   Cancelled.")
-        return 0
-
-    if answer not in ("y", "Y"):
-        print("   Fix cancelled.")
         return 0
 
     # F. Reconstruct EvidenceReport and call the existing Fixer.

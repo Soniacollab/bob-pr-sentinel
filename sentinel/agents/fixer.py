@@ -259,6 +259,9 @@ def run_fixer(evidence: EvidenceReport) -> FixReport:
         "(None and '' normalise to 0.0) without altering any other code path."
     )
 
+    # Keep the exact original source so a failed verification can be rolled back.
+    original_source = source
+
     source_path.write_text(patched_source, encoding="utf-8")
     report.files_modified.append(failing_file)
 
@@ -275,10 +278,11 @@ def run_fixer(evidence: EvidenceReport) -> FixReport:
     report.focused_test_result = focused_result
 
     if not focused_result.passed:
+        source_path.write_text(original_source, encoding="utf-8")
         report.status = "fix_failed"
         report.remaining_uncertainty = (
             "Focused tests still fail after the patch. "
-            "The applied fix did not fully resolve the regression."
+            "The patch was rolled back because the regression was not resolved."
         )
         return report
 
@@ -287,10 +291,11 @@ def run_fixer(evidence: EvidenceReport) -> FixReport:
     report.full_test_result = full_result
 
     if not full_result.passed:
+        source_path.write_text(original_source, encoding="utf-8")
         report.status = "fix_failed"
         report.remaining_uncertainty = (
             "Focused tests pass but the full suite reveals a new failure. "
-            "The patch introduced a regression elsewhere."
+            "The patch was rolled back because it introduced a regression elsewhere."
         )
         return report
 
