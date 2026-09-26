@@ -18,26 +18,27 @@ A small code change can quietly remove a defensive check, break an edge case, or
 ```text
 $ git push
 
-🛡️ Dev Sentinel
+🛡️  Dev Sentinel
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-   Analysing changes...
-   5 Python file(s) changed.
+   Analysing refs/heads/main (b2c3d4e5..a1b2c3d4) …
+   1 Python file(s) changed.
 
-   Exploring affected symbols...
-   Analysing behavioural impact...
-   Building targeted test plan...
-   Reproducing suspected regression...
+✗ PUSH BLOCKED
 
-✗  REGRESSION CONFIRMED
+Regression confirmed
 
-   user_score = None
-   → TypeError reproduced
+📍 Changed files
+   app/preprocessing.py
 
-⚠ PUSH BLOCKED
+🧪 Evidence
+   Tests passed: False
+   Exit code:    1
 
-   Review the incident with:
-   dev-sentinel fix
+🔎 Suspected cause
+   Removed guards: Combined None/empty-string guard removed.  Unhandled inputs: None → TypeError, "" → ValueError.  Confidence: high.
+
+→ Run `dev-sentinel fix` to review and authorize a fix.
 ```
 
 The developer stays in control.
@@ -45,19 +46,33 @@ The developer stays in control.
 ```text
 $ dev-sentinel fix
 
-   Confirmed regression:
-   float(None) raises TypeError
+🛡️  Dev Sentinel — Confirmed Regression
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-   Proposed fix:
-   restore defensive handling for missing input
+📍 Changed files
+   app/preprocessing.py
 
-   Apply this fix? [y/N] y
+🔄 Changed behaviour
+   Combined None/empty-string guard removed
 
-✓  Focused tests passed
-✓  Full test suite passed
-✓  Fix applied
+🧪 Evidence
+   Tests passed: False
+   Exit code:    1
 
-   Review, stage and commit the changes before pushing again.
+🔎 Suspected cause
+   Removed guards: Combined None/empty-string guard removed.  Unhandled inputs: None → TypeError, "" → ValueError.  Confidence: high.
+
+Apply this fix? [y/N] y
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Fix status:       fixed
+Files modified:   app/preprocessing.py
+Fix applied:      Restored None/empty-string guard around float() at app/preprocessing.py:10
+Focused tests:    passed (exit 0)
+Full suite:       passed (exit 0)
+
+✓  Fix applied and verified.
+   Review the changes, stage them, commit, and push again.
 ```
 
 **No automatic commit. No automatic push. No silent code modification.**
@@ -70,7 +85,7 @@ Traditional pre-push checks are good at answering:
 
 > **"Do the tests pass?"**
 
-But what happens when the test covering a new edge case **doesn't exist yet**?
+But what happens when a defensive check disappears and an **existing** edge-case test would catch it?
 
 Consider a seemingly harmless change:
 
@@ -96,9 +111,9 @@ now produces:
 TypeError
 ```
 
-The regression was introduced by removing a guard — and there may be no existing test for that input.
+The regression was introduced by removing a guard. In this repository, existing tests already cover `None` and `""` for `user_score`.
 
-**Dev Sentinel is designed for this gap.**
+**Dev Sentinel detects that kind of change, runs the relevant existing pytest target, and blocks the push only if those tests fail.** It builds a targeted test *plan* from the diff — it does not generate or write new test files.
 
 ---
 
