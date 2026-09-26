@@ -9,4 +9,4 @@
 # To bypass: git push --no-verify
 # To uninstall: dev-sentinel uninstall
 
-exec dev-sentinel-hook
+exec "$(git rev-parse --show-toplevel)/.venv/bin/dev-sentinel-hook"
