@@ -93,7 +93,7 @@ def orchestrate_investigation(changed_files: list[str], diff: str) -> EvidenceRe
     try:
         code_map = run_explorer(changed_files, diff)
     except Exception as exc:
-        report.status = "clean"
+        report.status = "analysis_failed"
         report.suspected_issue = f"Explorer raised an exception: {exc}"
         return report
 
@@ -101,7 +101,7 @@ def orchestrate_investigation(changed_files: list[str], diff: str) -> EvidenceRe
     try:
         impact = run_impact(changed_files, diff, code_map)
     except Exception as exc:
-        report.status = "clean"
+        report.status = "analysis_failed"
         report.suspected_issue = f"Impact raised an exception: {exc}"
         return report
 
@@ -119,7 +119,7 @@ def orchestrate_investigation(changed_files: list[str], diff: str) -> EvidenceRe
     try:
         test_plan = run_tester(changed_files, diff, code_map, impact)
     except Exception as exc:
-        report.status = "clean"
+        report.status = "analysis_failed"
         report.suspected_issue += f"  Tester raised an exception: {exc}"
         return report
 

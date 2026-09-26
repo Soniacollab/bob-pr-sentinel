@@ -300,24 +300,24 @@ class TestInvalidInputs:
         assert result.status == "clean"
 
     @patch("sentinel.orchestrator.run_explorer", side_effect=RuntimeError("boom"))
-    def test_explorer_exception_returns_clean(self, mock_explorer):
+    def test_explorer_exception_returns_analysis_failed(self, mock_explorer):
         result = orchestrate_investigation(["app/foo.py"], "- x\n")
-        assert result.status == "clean"
+        assert result.status == "analysis_failed"
         assert "Explorer" in result.suspected_issue
 
     @patch("sentinel.orchestrator.run_impact",  side_effect=RuntimeError("boom"))
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_impact_exception_returns_clean(self, me, mi):
+    def test_impact_exception_returns_analysis_failed(self, me, mi):
         result = orchestrate_investigation(["app/foo.py"], "- x\n")
-        assert result.status == "clean"
+        assert result.status == "analysis_failed"
         assert "Impact" in result.suspected_issue
 
     @patch("sentinel.orchestrator.run_tester",  side_effect=RuntimeError("boom"))
     @patch("sentinel.orchestrator.run_impact",  return_value=_high_impact())
     @patch("sentinel.orchestrator.run_explorer", return_value=_empty_code_map())
-    def test_tester_exception_returns_clean(self, me, mi, mt):
+    def test_tester_exception_returns_analysis_failed(self, me, mi, mt):
         result = orchestrate_investigation(["app/foo.py"], "- guard\n")
-        assert result.status == "clean"
+        assert result.status == "analysis_failed"
         assert "Tester" in result.suspected_issue
 
     @patch("sentinel.orchestrator._safe_run_tests", return_value=_failing_result())

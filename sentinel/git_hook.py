@@ -301,6 +301,18 @@ def _print_result(status: str, report: EvidenceReport) -> None:
 
         print("→ Run `dev-sentinel fix` to review and authorize a fix.")
         print()
+    elif status == "analysis_failed":
+        print()
+        print("⚠ PUSH BLOCKED")
+        print()
+        print("Dev Sentinel could not complete its analysis.")
+        if report.suspected_issue:
+            print("Reason:")
+            print(f"   {report.suspected_issue}")
+            print()
+            print("   No fix was applied.")
+            print("   Resolve the analysis problem and push again.")
+            print()
     else:
         # "pending" or any unexpected value — treat conservatively
         print()
