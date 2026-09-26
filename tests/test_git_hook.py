@@ -184,6 +184,20 @@ class TestDiffForRef:
         assert diff == ""
 
     @patch("sentinel.git_hook._git")
+    def test_diff_commands_use_default_fail_closed_behavior(self, mock_git):
+        """Git diff commands must rely on _git's fail-closed default."""
+        mock_git.side_effect = [
+            "app/preprocessing.py",
+            "--- a/app/preprocessing.py\n+stub",
+        ]
+        ref = _normal_ref()
+
+        _diff_for_ref(ref)
+
+        assert mock_git.call_args_list[0].kwargs.get("check", True) is True
+        assert mock_git.call_args_list[1].kwargs.get("check", True) is True
+
+    @patch("sentinel.git_hook._git")
     def test_only_python_files_in_diff(self, mock_git):
         """Non-Python files are excluded — only *.py is passed to git diff."""
         mock_git.side_effect = [

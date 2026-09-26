@@ -159,7 +159,6 @@ def _diff_for_ref(ref: PushRef) -> tuple[list[str], str]:
     # diff here avoids feeding unrelated binary blobs to the agents.
     changed_files_raw = _git(
         "diff", "--name-only", f"{base}..{tip}", "--", "*.py",
-        check=False,
     )
     changed_files = [f for f in changed_files_raw.splitlines() if f.strip()]
 
@@ -168,7 +167,6 @@ def _diff_for_ref(ref: PushRef) -> tuple[list[str], str]:
 
     diff_text = _git(
         "diff", f"{base}..{tip}", "--", "*.py",
-        check=False,
     )
     return changed_files, diff_text
 
